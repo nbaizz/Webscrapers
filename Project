@@ -1,0 +1,188 @@
+#Webscrapers final project
+
+import sqlite3
+import requests
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+def setup_database():
+    conn = sqlite3.connect("project_data.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS CensusData (
+            CountyID INTEGER PRIMARY KEY,
+            CountyName TEXT,
+            MedianIncome INTEGER,
+            Population INTEGER
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS YelpBusinesses (
+            BusinessID TEXT PRIMARY KEY,
+            Name TEXT,
+            Category TEXT,
+            CountyID INTEGER,
+            AvgRating REAL,
+            FOREIGN KEY (CountyID) REFERENCES CensusData(CountyID)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS YelpReviews (
+            ReviewID TEXT PRIMARY KEY,
+            BusinessID TEXT,
+            StarRating INTEGER,
+            ReviewText TEXT,
+            Date TEXT,
+            FOREIGN KEY (BusinessID) REFERENCES YelpBusinesses(BusinessID)
+        )
+    ''')
+    conn.commit()
+    return conn
+
+# Fetch Census Data
+def fetch_census_data(api_key):
+    url = f"https://api.census.gov/data/2020/acs/acs5?get=NAME,B19013_001E,POPULATION&for=county:*&in=state:26&key={api_key}"
+    response = requests.get(url)
+    data = response.json()[1:]  # Skip the headers
+    return [
+        {
+            "CountyID": int(item[3]),
+            "CountyName": item[0],
+            "MedianIncome": int(item[1]),
+            "Population": int(item[2]),
+        }
+        for item in data
+    ]
+
+# Insert Census Data into Database
+def store_census_data(conn, data):
+    cursor = conn.cursor()
+    for item in data:
+        cursor.execute('''
+            INSERT OR IGNORE INTO CensusData (CountyID, CountyName, MedianIncome, Population)
+            VALUES (?, ?, ?, ?)
+        ''', (item["CountyID"], item["CountyName"], item["MedianIncome"], item["Population"]))
+    conn.commit()
+
+# Fetch Yelp Business Data
+def fetch_yelp_businesses(api_key, location):
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url = f"https://api.yelp.com/v3/businesses/search?location={location}&categories=restaurants&limit=20"
+    response = requests.get(url, headers=headers)
+    data = response.json()
+    return [
+        {
+            "BusinessID": biz["id"],
+            "Name": biz["name"],
+            "Category": ", ".join([cat["title"] for cat in biz["categories"]]),
+            "AvgRating": biz["rating"],
+        }
+        for biz in data.get("businesses", [])
+    ]
+
+# Insert Yelp Business Data into Database
+def store_yelp_businesses(conn, businesses, county_id):
+    cursor = conn.cursor()
+    for biz in businesses:
+        cursor.execute('''
+            INSERT OR IGNORE INTO YelpBusinesses (BusinessID, Name, Category, CountyID, AvgRating)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (biz["BusinessID"], biz["Name"], biz["Category"], county_id, biz["AvgRating"]))
+    conn.commit()
+
+# Fetch Yelp Reviews Data
+def fetch_yelp_reviews(api_key, business_id):
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url = f"https://api.yelp.com/v3/businesses/{business_id}/reviews"
+    response = requests.get(url, headers=headers)
+    data = response.json()
+    return [
+        {
+            "ReviewID": review["id"],
+            "BusinessID": business_id,
+            "StarRating": review["rating"],
+            "ReviewText": review["text"],
+            "Date": review["time_created"],
+        }
+        for review in data.get("reviews", [])
+    ]
+
+# Insert Yelp Reviews Data into Database
+def store_yelp_reviews(conn, reviews):
+    cursor = conn.cursor()
+    for review in reviews:
+        cursor.execute('''
+            INSERT OR IGNORE INTO YelpReviews (ReviewID, BusinessID, StarRating, ReviewText, Date)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (review["ReviewID"], review["BusinessID"], review["StarRating"], review["ReviewText"], review["Date"]))
+    conn.commit()
+
+# Analyze Data
+def analyze_data(conn):
+    cursor = conn.cursor()
+    query = '''
+        SELECT 
+            CensusData.CountyName,
+            CensusData.MedianIncome,
+            AVG(YelpBusinesses.AvgRating) as AvgRating
+        FROM CensusData
+        JOIN YelpBusinesses ON CensusData.CountyID = YelpBusinesses.CountyID
+        GROUP BY CensusData.CountyName, CensusData.MedianIncome
+    '''
+    cursor.execute(query)
+    return cursor.fetchall()
+
+def visualize_data(data):
+    counties = [item[0] for item in data]
+    incomes = [item[1] for item in data]
+    ratings = [item[2] for item in data]
+
+    fig, ax1 = plt.subplots()
+
+    color = 'tab:blue'
+    ax1.set_xlabel('County')
+    ax1.set_ylabel('Median Income', color=color)
+    ax1.bar(counties, incomes, color=color, alpha=0.7, label="Median Income")
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.set_xticklabels(counties, rotation=90)
+
+    ax2 = ax1.twinx()
+    color = 'tab:red'
+    ax2.set_ylabel('Average Yelp Rating', color=color)
+    ax2.plot(counties, ratings, color=color, marker='o', label="Avg Rating")
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    fig.tight_layout()
+    plt.title("Median Income vs. Average Yelp Rating by County")
+    plt.legend()
+    plt.show()
+
+def main():
+    CENSUS_API_KEY = "your_census_api_key"
+    YELP_API_KEY = "your_yelp_api_key"
+
+    conn = setup_database()
+
+    # Step 1: Fetch and store Census data
+    census_data = fetch_census_data(CENSUS_API_KEY)
+    store_census_data(conn, census_data)
+
+    # Step 2: Fetch and store Yelp data for each county
+    for county in census_data:
+        county_name = county["CountyName"].split(",")[0]  # Simplify county name
+        businesses = fetch_yelp_businesses(YELP_API_KEY, county_name)
+        store_yelp_businesses(conn, businesses, county["CountyID"])
+
+        # Fetch and store reviews for each business
+        for business in businesses:
+            reviews = fetch_yelp_reviews(YELP_API_KEY, business["BusinessID"])
+            store_yelp_reviews(conn, reviews)
+
+    # Step 3: Analyze and visualize data
+    analyzed_data = analyze_data(conn)
+    visualize_data(analyzed_data)
+
+    conn.close()
+
+if __name__ == "__main__":
+    main()
